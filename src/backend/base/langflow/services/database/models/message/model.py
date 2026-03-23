@@ -136,6 +136,8 @@ class MessageTable(MessageBase, table=True):  # type: ignore[call-arg]
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
     flow_id: UUID | None = Field(default=None)
+    run_id: UUID | None = Field(default=None, index=True)
+    is_output: bool = Field(default=False)
 
     files: list[str] = Field(sa_column=Column(JSON))
     properties: dict | Properties = Field(  # type: ignore[assignment]
