@@ -126,7 +126,9 @@ async def list_memory_bases(
     """
     async with session_scope() as db:
         stmt = _service.list_for_user_stmt(user_id=current_user.id)
-        return await apaginate(db, stmt, params=params, transformer=lambda items: [MemoryBaseRead.model_validate(m) for m in items])
+        return await apaginate(
+            db, stmt, params=params, transformer=lambda items: [MemoryBaseRead.model_validate(m) for m in items]
+        )
 
 
 @router.get("/{memory_base_id}", status_code=HTTPStatus.OK)
