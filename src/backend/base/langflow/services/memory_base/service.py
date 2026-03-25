@@ -1,7 +1,9 @@
 """MemoryBase service – business logic for CRUD and ingestion orchestration.
 
 Edge cases handled:
+- Name uniqueness per user: 409 if a Memory Base with the same name already exists.
 - Deletion during sync: cancels active tasks before DB deletion.
+- KB deletion on delete: removes the associated KB directory from disk.
 - Concurrent task prevention: returns 409 if a job is already IN_PROGRESS.
 - Threshold updates: deferred; does not re-evaluate pending count immediately.
 - FS / Vector DB mismatch: detects and surfaces a warning flag.
@@ -10,11 +12,14 @@ Edge cases handled:
 
 from __future__ import annotations
 
+import json
+import re
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from lfx.log.logger import logger
-from sqlmodel import col, func, select
+from sqlmodel import col, distinct, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from langflow.api.utils.kb_helpers import KBAnalysisHelper, KBStorageHelper
@@ -30,6 +35,34 @@ from langflow.services.database.models.message.model import MessageTable
 from langflow.services.deps import get_job_service, get_task_service, session_scope
 from langflow.services.memory_base.task import ingest_memory_task
 
+# Provider inference map — mirrors provider_patterns in KBAnalysisHelper._detect_embedding_provider
+# so we can derive the provider from a model name string without filesystem access.
+_MODEL_TO_PROVIDER: list[tuple[list[str], str]] = [
+    (["text-embedding", "ada-", "gpt-"], "OpenAI"),
+    (["embed-english", "embed-multilingual"], "Cohere"),
+    (["sentence-transformers", "bert-", "huggingface"], "HuggingFace"),
+    (["palm", "gecko", "google"], "Google"),
+    (["ollama"], "Ollama"),
+    (["azure"], "Azure OpenAI"),
+]
+
+
+def _infer_embedding_provider(embedding_model: str) -> str:
+    """Derive embedding provider name from a model string."""
+    lower = embedding_model.lower()
+    for patterns, provider in _MODEL_TO_PROVIDER:
+        if any(p in lower for p in patterns):
+            return provider
+    return "OpenAI"  # Safe default — matches _resolve_embedding fallback
+
+
+def _sanitize_kb_name(name: str) -> str:
+    """Lowercase, replace spaces/hyphens with underscores, strip non-alphanum."""
+    sanitized = name.strip().lower()
+    sanitized = re.sub(r"[\s\-]+", "_", sanitized)
+    sanitized = re.sub(r"[^\w]", "", sanitized)
+    return sanitized or "memory"
+
 
 class MemoryBaseService:
     """Service layer for MemoryBase CRUD and ingestion orchestration."""
@@ -40,49 +73,99 @@ class MemoryBaseService:
 
     async def create(self, payload: MemoryBaseCreate, user_id: uuid.UUID) -> MemoryBase:
         async with session_scope() as db:
-            mb = MemoryBase(**payload.model_dump(), user_id=user_id)
+            # 1. Name uniqueness per user
+            existing = await db.exec(
+                select(MemoryBase).where(MemoryBase.user_id == user_id).where(MemoryBase.name == payload.name)
+            )
+            if existing.first() is not None:
+                msg = f"A Memory Base named '{payload.name}' already exists for this user"
+                raise ValueError(msg)
+
+            # 2. Resolve username for KB path
+            kb_username = await self._resolve_kb_username(db, user_id)
+
+        # 3. Auto-generate kb_name: sanitized_name_<8hex>
+        kb_name = f"{_sanitize_kb_name(payload.name)}_{uuid.uuid4().hex[:8]}"
+
+        # 4. Create KB directory and embedding_metadata.json on disk
+        embedding_provider = _infer_embedding_provider(payload.embedding_model)
+        await self._initialize_kb(
+            kb_name=kb_name,
+            kb_username=kb_username,
+            embedding_provider=embedding_provider,
+            embedding_model=payload.embedding_model,
+        )
+
+        # 5. Persist DB record
+        async with session_scope() as db:
+            mb = MemoryBase(
+                **payload.model_dump(exclude={"user_id"}),
+                user_id=user_id,
+                kb_name=kb_name,
+            )
             db.add(mb)
             await db.commit()
             await db.refresh(mb)
 
-        # Stamp is_memory_base: true on the KB metadata file immediately so that
-        # the Knowledge Retrieval component filters it out from the first moment
-        # this KB is designated as a Memory Base, before any sync has occurred.
-        await self._stamp_memory_base_flag(mb)
-
         return mb
 
-    async def _stamp_memory_base_flag(self, mb: MemoryBase) -> None:
-        """Write is_memory_base: true into the KB's embedding_metadata.json.
+    async def _initialize_kb(
+        self,
+        *,
+        kb_name: str,
+        kb_username: str,
+        embedding_provider: str,
+        embedding_model: str,
+    ) -> None:
+        """Create KB directory, initialize Chroma, and write embedding_metadata.json.
 
-        Best-effort: a missing or unwritable KB path is logged but not fatal —
-        the flag will be set during the first successful ingestion sync instead.
+        Mirrors the logic in knowledge_bases.py:create_knowledge_base so Memory Base
+        KBs are immediately visible with the correct metadata (including is_memory_base: true).
         """
-        import json
+        import chromadb
 
+        kb_root = KBStorageHelper.get_root_path()
+        if not kb_root:
+            await logger.awarning("KB root path not configured — Memory Base KB will not be initialized on disk.")
+            return
+
+        kb_path: Path = kb_root / kb_username / kb_name
+        kb_path.mkdir(parents=True, exist_ok=True)
+
+        # Initialize Chroma collection so the directory is non-empty and readable
         try:
-            kb_username = await self._resolve_kb_username_by_user_id(mb.user_id)
-            kb_root = KBStorageHelper.get_root_path()
-            if not kb_root:
-                return
-            kb_path = kb_root / kb_username / mb.kb_name
-            if not kb_path.exists():
-                return
-            metadata = KBAnalysisHelper.get_metadata(kb_path, fast=True)
-            if metadata.get("is_memory_base") is True:
-                return  # Already stamped
-            metadata["is_memory_base"] = True
-            (kb_path / "embedding_metadata.json").write_text(json.dumps(metadata, indent=2))
-        except Exception:
-            await logger.awarning(
-                "Could not stamp is_memory_base on KB '%s' — will be set at first sync.", mb.kb_name, exc_info=True
-            )
+            client = KBStorageHelper.get_fresh_chroma_client(kb_path)
+            client.create_collection(name=kb_name)
+        except (OSError, ValueError, chromadb.errors.ChromaError) as exc:
+            await logger.awarning("Initial Chroma setup for %s failed: %s", kb_name, exc)
+        finally:
+            client = None  # type: ignore[assignment]
+            KBStorageHelper.release_chroma_resources(kb_path)
+
+        embedding_metadata = {
+            "id": str(uuid.uuid4()),
+            "embedding_provider": embedding_provider,
+            "embedding_model": embedding_model,
+            "is_memory_base": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "chunks": 0,
+            "words": 0,
+            "characters": 0,
+            "avg_chunk_size": 0.0,
+            "size": 0,
+            "source_types": ["memory"],
+        }
+        (kb_path / "embedding_metadata.json").write_text(json.dumps(embedding_metadata, indent=2))
 
     async def list_for_user(self, user_id: uuid.UUID) -> list[MemoryBase]:
         async with session_scope() as db:
             stmt = select(MemoryBase).where(MemoryBase.user_id == user_id)
             result = await db.exec(stmt)
             return list(result.all())
+
+    def list_for_user_stmt(self, user_id: uuid.UUID):  # type: ignore[return]
+        """Return the SQLModel select statement for pagination at the API layer."""
+        return select(MemoryBase).where(MemoryBase.user_id == user_id)
 
     async def get(self, memory_base_id: uuid.UUID, user_id: uuid.UUID) -> MemoryBase | None:
         async with session_scope() as db:
@@ -115,10 +198,12 @@ class MemoryBaseService:
             return mb
 
     async def delete(self, memory_base_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-        """Delete a MemoryBase.
+        """Delete a MemoryBase and its associated KB directory.
 
-        Edge case: If a sync task is active, cancel it BEFORE committing the
-        database deletion to avoid dangling background work.
+        Edge cases:
+        - If a sync task is active, cancel it BEFORE committing the DB deletion.
+        - KB directory deletion is best-effort after the DB commit — a failure
+          is logged but not re-raised so the caller always gets a clean 204.
         """
         async with session_scope() as db:
             stmt = select(MemoryBase).where(MemoryBase.id == memory_base_id).where(MemoryBase.user_id == user_id)
@@ -127,40 +212,103 @@ class MemoryBaseService:
             if mb is None:
                 return False
 
-            # Cancel any active ingestion jobs for this memory base
+            kb_name = mb.kb_name
+            kb_username = await self._resolve_kb_username(db, user_id)
+
+            # Cancel active ingestion jobs before removing the DB record
             await self._cancel_active_jobs(memory_base_id=memory_base_id, db=db)
 
             await db.delete(mb)
             await db.commit()
-            return True
+
+        # Delete the corresponding KB from disk (best-effort — DB already committed)
+        await self._delete_kb(kb_name=kb_name, kb_username=kb_username)
+
+        return True
+
+    async def _delete_kb(self, *, kb_name: str, kb_username: str) -> None:
+        """Remove the KB directory from disk. Logs on failure, does not raise."""
+        if not kb_name:
+            return
+        kb_root = KBStorageHelper.get_root_path()
+        if not kb_root:
+            return
+        kb_path = kb_root / kb_username / kb_name
+        try:
+            KBStorageHelper.delete_storage(kb_path, kb_name)
+        except Exception:
+            await logger.awarning(
+                "Could not delete KB '%s' from disk after Memory Base deletion.", kb_name, exc_info=True
+            )
 
     # ------------------------------------------------------------------ #
     #  Sessions                                                             #
     # ------------------------------------------------------------------ #
 
     async def get_sessions(self, memory_base_id: uuid.UUID, user_id: uuid.UUID) -> list[MemoryBaseSessionRead]:
-        """Return all tracked sessions with pending message counts."""
+        """Return all sessions with pending message counts.
+
+        Includes sessions that have output messages in MessageTable for the
+        associated flow but no MemoryBaseSession record yet (i.e. never synced).
+        """
         async with session_scope() as db:
             # Verify ownership
             mb = await self._get_mb_or_raise(db, memory_base_id, user_id)
 
+            # All tracked sessions
             stmt = select(MemoryBaseSession).where(MemoryBaseSession.memory_base_id == memory_base_id)
             result = await db.exec(stmt)
-            sessions = list(result.all())
+            tracked = list(result.all())
+            tracked_ids = {s.session_id for s in tracked}
+
+            # All sessions that have flow output messages (may include untracked ones)
+            dist_stmt = select(distinct(MessageTable.session_id)).where(
+                MessageTable.flow_id == mb.flow_id,
+                MessageTable.is_output == True,  # noqa: E712
+            )
+            dist_result = await db.exec(dist_stmt)
+            all_session_ids: set[str] = {row for row in dist_result.all() if row}
 
             output: list[MemoryBaseSessionRead] = []
-            for s in sessions:
+
+            # Tracked sessions — compute pending count from cursor
+            for s in tracked:
                 pending = await self._count_pending(db, mb, s)
-                read = MemoryBaseSessionRead(
-                    id=s.id,
-                    memory_base_id=s.memory_base_id,
-                    session_id=s.session_id,
-                    cursor_id=s.cursor_id,
-                    total_processed=s.total_processed,
-                    last_sync_at=s.last_sync_at,
-                    pending_count=pending,
+                output.append(
+                    MemoryBaseSessionRead(
+                        id=s.id,
+                        memory_base_id=s.memory_base_id,
+                        session_id=s.session_id,
+                        cursor_id=s.cursor_id,
+                        total_processed=s.total_processed,
+                        last_sync_at=s.last_sync_at,
+                        pending_count=pending,
+                    )
                 )
-                output.append(read)
+
+            # Untracked sessions — all their output messages are pending
+            for sid in sorted(all_session_ids - tracked_ids):
+                count_stmt = (
+                    select(func.count())
+                    .select_from(MessageTable)
+                    .where(MessageTable.flow_id == mb.flow_id)
+                    .where(MessageTable.session_id == sid)
+                    .where(MessageTable.is_output == True)  # noqa: E712
+                )
+                count_result = await db.exec(count_stmt)
+                pending = count_result.one()
+                output.append(
+                    MemoryBaseSessionRead(
+                        id=uuid.uuid4(),  # Synthetic — no DB row yet
+                        memory_base_id=memory_base_id,
+                        session_id=sid,
+                        cursor_id=None,
+                        total_processed=0,
+                        last_sync_at=None,
+                        pending_count=pending,
+                    )
+                )
+
             return output
 
     # ------------------------------------------------------------------ #
@@ -419,10 +567,6 @@ class MemoryBaseService:
 
     async def _has_active_job(self, db: AsyncSession, memory_base_id: uuid.UUID, session_id: str) -> bool:
         """Check whether an ingestion job is already IN_PROGRESS for this (mb, session)."""
-        # We store jobs with asset_id=memory_base_id and asset_type="memory_base".
-        # session_id granularity is not tracked in the Job table; we use memory_base_id
-        # as the granularity guard (one active job per MB per session pair is handled
-        # by checking any active job for the asset_id).
         stmt = (
             select(func.count())
             .select_from(Job)
